@@ -1,15 +1,7 @@
-"""Geocoding + current weather.
-
-Primary: **Open-Meteo** (no API key; real lat/lon + live conditions).
-
-Optional: **OpenWeather** only if ``OPENWEATHER_API_KEY`` is set and
-``USE_OPENWEATHER=1`` — then we try OpenWeather first and fall back to
-Open-Meteo on any failure (keys, 401, quota).
-"""
+"""Geocoding + current weather via Open-Meteo."""
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import requests
@@ -17,9 +9,6 @@ import requests
 OPEN_METEO_GEO = "https://geocoding-api.open-meteo.com/v1/search"
 OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
 NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
-
-OW_GEOCODE_URL = "https://api.openweathermap.org/geo/1.0/direct"
-OW_WEATHER_URL = "https://api.openweathermap.org/data/2.5/weather"
 
 # Identify this app for Nominatim usage policy.
 NOMINATIM_UA = "MDM-CropAdvisory/1.0 (university project; educational use)"
@@ -29,26 +18,7 @@ class WeatherError(Exception):
     """Raised when location or weather cannot be fetched."""
 
 
-def _clean_api_key(raw: str) -> str:
-    k = raw.strip()
-    if len(k) >= 2 and k[0] == k[-1] and k[0] in "\"'":
-        k = k[1:-1].strip()
-    if k.startswith("\ufeff"):
-        k = k.lstrip("\ufeff").strip()
-    return k
-
-
-def _openweather_key() -> str | None:
-    k = _clean_api_key(os.environ.get("OPENWEATHER_API_KEY", ""))
-    return k or None
-
-
-def _use_openweather_first() -> bool:
-    v = os.environ.get("USE_OPENWEATHER", "").strip().lower()
-    return v in ("1", "true", "yes")
-
-
-# --- Open-Meteo (default) -----------------------------------------------------
+# --- Open-Meteo ---------------------------------------------------------------
 
 
 def _om_search_variants(place: str) -> list[str]:
@@ -175,112 +145,6 @@ def fetch_weather_open_meteo(lat: float, lon: float) -> tuple[float, float, floa
     return temp, humidity, max(0.0, rainfall)
 
 
-# --- OpenWeather (optional) ---------------------------------------------------
-
-
-def _ow_geocode_queries(place: str) -> list[str]:
-    p = place.strip()
-    if not p:
-        return []
-    queries = [p]
-    lower = p.lower()
-    if "," not in p:
-        queries.extend([f"{p}, IN", f"{p}, India", f"{p}, Maharashtra, IN"])
-    else:
-        if (
-            "india" not in lower
-            and not lower.endswith(", in")
-            and "maharashtra" not in lower
-        ):
-            queries.append(f"{p}, IN")
-    seen: set[str] = set()
-    out: list[str] = []
-    for q in queries:
-        if q not in seen:
-            seen.add(q)
-            out.append(q)
-    return out
-
-
-def _fetch_ow_geocode_raw(query: str, api_key: str, *, limit: int = 5) -> list[dict[str, Any]]:
-    r = requests.get(
-        OW_GEOCODE_URL,
-        params={"q": query, "limit": limit, "appid": api_key},
-        timeout=15,
-    )
-    if r.status_code == 401:
-        raise WeatherError(
-            "OpenWeather returned 401 Unauthorized. Check OPENWEATHER_API_KEY or disable USE_OPENWEATHER."
-        )
-    if r.status_code != 200:
-        raise WeatherError(f"OpenWeather geocoding failed (HTTP {r.status_code}).")
-    data = r.json()
-    if isinstance(data, dict):
-        msg = str(data.get("message") or data.get("cod") or data)
-        raise WeatherError(f"OpenWeather geocoding error: {msg}")
-    return data  # type: ignore[return-value]
-
-
-def _pick_ow_row(rows: list[dict[str, Any]], original_place: str) -> dict[str, Any] | None:
-    if not rows:
-        return None
-    for row in rows:
-        if row.get("country") == "IN":
-            return row
-    original = original_place.strip().lower().split(",")[0].strip()
-    for row in rows:
-        name = str(row.get("name") or "").lower()
-        if original and (original in name or name in original):
-            return row
-    return rows[0]
-
-
-def geocode_openweather(place: str, api_key: str) -> tuple[float, float, str]:
-    place = place.strip()
-    if not place:
-        raise WeatherError("Location is empty.")
-    for q in _ow_geocode_queries(place):
-        rows = _fetch_ow_geocode_raw(q, api_key, limit=5)
-        row = _pick_ow_row(rows, place)
-        if row is None:
-            continue
-        lat, lon = float(row["lat"]), float(row["lon"])
-        name = row.get("name") or place.split(",")[0].strip()
-        state = row.get("state") or ""
-        country = row.get("country") or ""
-        parts = [name]
-        if state:
-            parts.append(state)
-        if country:
-            parts.append(country)
-        return lat, lon, ", ".join(parts)
-    raise WeatherError("OpenWeather: location not found.")
-
-
-def fetch_weather_openweather(lat: float, lon: float, api_key: str) -> tuple[float, float, float]:
-    r = requests.get(
-        OW_WEATHER_URL,
-        params={"lat": lat, "lon": lon, "appid": api_key, "units": "metric"},
-        timeout=15,
-    )
-    if r.status_code != 200:
-        raise WeatherError(f"OpenWeather weather failed (HTTP {r.status_code}).")
-    body = r.json()
-    try:
-        temp = float(body["main"]["temp"])
-        humidity = float(body["main"]["humidity"])
-    except (KeyError, TypeError, ValueError) as e:
-        raise WeatherError("OpenWeather response missing temperature or humidity.") from e
-    rain = body.get("rain") or {}
-    rainfall = 0.0
-    if isinstance(rain, dict):
-        if "1h" in rain:
-            rainfall = float(rain["1h"])
-        elif "3h" in rain:
-            rainfall = float(rain["3h"]) / 3.0
-    return temp, humidity, rainfall
-
-
 # --- Public API ---------------------------------------------------------------
 
 
@@ -290,17 +154,8 @@ def resolve_place_and_weather(
     """
     Return (lat, lon, display_name, temp_c, humidity_pct, rainfall_mm, provider_label).
 
-    ``provider_label`` is ``"openweather"`` or ``"open-meteo"``.
+    ``provider_label`` is always ``"open-meteo"``.
     """
-    ow_key = _openweather_key()
-    if ow_key and _use_openweather_first():
-        try:
-            lat, lon, display = geocode_openweather(place, ow_key)
-            temp, hum, rain = fetch_weather_openweather(lat, lon, ow_key)
-            return lat, lon, display, temp, hum, rain, "openweather"
-        except WeatherError:
-            pass
-
     lat, lon, display = geocode_open_meteo(place)
     temp, hum, rain = fetch_weather_open_meteo(lat, lon)
     return lat, lon, display, temp, hum, rain, "open-meteo"
@@ -309,20 +164,8 @@ def resolve_place_and_weather(
 # Backwards-compatible names (used by tests or imports)
 
 def geocode_location(place: str, **_kwargs: Any) -> tuple[float, float, str]:
-    ow_key = _openweather_key()
-    if ow_key and _use_openweather_first():
-        try:
-            return geocode_openweather(place, ow_key)
-        except WeatherError:
-            pass
     return geocode_open_meteo(place)
 
 
 def fetch_weather(lat: float, lon: float) -> tuple[float, float, float]:
-    ow_key = _openweather_key()
-    if ow_key and _use_openweather_first():
-        try:
-            return fetch_weather_openweather(lat, lon, ow_key)
-        except WeatherError:
-            pass
     return fetch_weather_open_meteo(lat, lon)
